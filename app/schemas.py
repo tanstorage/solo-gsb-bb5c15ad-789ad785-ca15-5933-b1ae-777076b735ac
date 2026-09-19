@@ -12,6 +12,11 @@ class CreateSessionRequest(BaseModel):
     file_digest: str = Field(min_length=1, max_length=256, description="期望的完整文件摘要")
     digest_algorithm: str = Field(default="sha256", min_length=1, max_length=32,
                                   description="摘要算法标识，仅作记录")
+    dependencies: Optional[dict[int, list[int]]] = Field(
+        default=None,
+        description="依赖图：键与值均为分片序号；chunk 领取前其值列出的前置分片必须全部完成。"
+                    "缺省（null）表示无依赖，各分片立即可领取。服务端拒绝越界、自依赖与有环关系。",
+    )
 
 
 class SessionResponse(BaseModel):
@@ -73,6 +78,7 @@ class ChunkStatus(BaseModel):
     lease_expires_at: Optional[datetime] = None
     chunk_digest: Optional[str] = None
     completed_at: Optional[datetime] = None
+    dependencies: list[int] = Field(default_factory=list, description="领取前必须完成的前置分片序号（按序）")
 
 
 class SessionStatusResponse(BaseModel):
@@ -86,3 +92,14 @@ class SessionStatusResponse(BaseModel):
     created_at: datetime
     finalized_at: Optional[datetime] = None
     chunks: list[ChunkStatus]
+
+
+class BlockedChunk(BaseModel):
+    chunk_index: int
+    missing_dependencies: list[int] = Field(description="尚未完成的前置分片序号（按序）")
+
+
+class ReadyResponse(BaseModel):
+    session_id: str
+    ready: list[int] = Field(description="当前可领取且无有效租约的分片序号（按序）")
+    blocked: list[BlockedChunk] = Field(description="被依赖阻塞、暂不可领取的分片及其未完成前置项")

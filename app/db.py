@@ -36,6 +36,19 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_id);
+
+-- 依赖图：chunk_index 领取前必须先完成 depends_on（同一分片的前置分片）
+CREATE TABLE IF NOT EXISTS chunk_dependencies (
+    session_id   TEXT NOT NULL,
+    chunk_index  INTEGER NOT NULL,
+    depends_on   INTEGER NOT NULL,
+    PRIMARY KEY (session_id, chunk_index, depends_on),
+    FOREIGN KEY (session_id, chunk_index) REFERENCES chunks(session_id, chunk_index),
+    CHECK (chunk_index >= 0 AND depends_on >= 0 AND chunk_index <> depends_on)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deps_session ON chunk_dependencies(session_id);
+CREATE INDEX IF NOT EXISTS idx_deps_depends ON chunk_dependencies(session_id, depends_on);
 """
 
 
