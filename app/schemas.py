@@ -4,7 +4,49 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+def validate_dependencies(
+    dependencies: dict[int, list[int]], total_chunks: int
+) -> dict[int, list[int]]:
+    """校验并规范化依赖图：拒绝越界、自依赖与有环关系；返回去重、升序后的图。"""
+    normalized: dict[int, list[int]] = {}
+    for chunk_index, deps in dependencies.items():
+        if not 0 <= chunk_index < total_chunks:
+            raise ValueError(
+                f"dependency key {chunk_index} out of range [0, {total_chunks})"
+            )
+        unique = sorted(set(deps))
+        for dep in unique:
+            if not 0 <= dep < total_chunks:
+                raise ValueError(
+                    f"dependency {dep} of chunk {chunk_index} out of range [0, {total_chunks})"
+                )
+            if dep == chunk_index:
+                raise ValueError(f"chunk {chunk_index} cannot depend on itself")
+        if unique:
+            normalized[chunk_index] = unique
+
+    # 环检测（Kahn 拓扑）：仅键集合内部的子图可能成环，非键节点均为汇点
+    indegree = {node: 0 for node in normalized}
+    for deps in normalized.values():
+        for dep in deps:
+            if dep in indegree:
+                indegree[dep] += 1
+    queue = [node for node, deg in indegree.items() if deg == 0]
+    visited = 0
+    while queue:
+        node = queue.pop()
+        visited += 1
+        for dep in normalized[node]:
+            if dep in indegree:
+                indegree[dep] -= 1
+                if indegree[dep] == 0:
+                    queue.append(dep)
+    if visited != len(normalized):
+        raise ValueError("dependencies contain a cycle")
+    return normalized
 
 
 class CreateSessionRequest(BaseModel):
@@ -12,6 +54,16 @@ class CreateSessionRequest(BaseModel):
     file_digest: str = Field(min_length=1, max_length=256, description="期望的完整文件摘要")
     digest_algorithm: str = Field(default="sha256", min_length=1, max_length=32,
                                   description="摘要算法标识，仅作记录")
+    dependencies: Optional[dict[int, list[int]]] = Field(
+        default=None,
+        description="分片依赖图：键为分片序号，值为该分片领取租约前必须完成的前置分片序号列表；"
+                    "缺省表示无依赖（保持原有调度行为）")
+
+    @model_validator(mode="after")
+    def _validate_dependencies(self):
+        if self.dependencies:
+            self.dependencies = validate_dependencies(self.dependencies, self.total_chunks)
+        return self
 
 
 class SessionResponse(BaseModel):
@@ -73,6 +125,21 @@ class ChunkStatus(BaseModel):
     lease_expires_at: Optional[datetime] = None
     chunk_digest: Optional[str] = None
     completed_at: Optional[datetime] = None
+    dependencies: list[int] = Field(default_factory=list,
+                                    description="领取租约前必须完成的前置分片（升序）")
+
+
+class BlockedChunk(BaseModel):
+    chunk_index: int
+    missing_dependencies: list[int] = Field(description="尚未完成的前置分片（升序）")
+
+
+class ReadyResponse(BaseModel):
+    session_id: str
+    ready_chunks: list[int] = Field(
+        description="当前可领取的分片：未完成、无有效租约（过期租约视为可领取）且前置已全部完成")
+    blocked_chunks: list[BlockedChunk] = Field(
+        description="被依赖阻塞的分片及各自未完成的前置项")
 
 
 class SessionStatusResponse(BaseModel):

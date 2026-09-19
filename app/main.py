@@ -1,11 +1,13 @@
 """断点分片上传协调 API。
 
 仅协调元数据：不接收、不保存任何文件内容。
-- 创建会话：记录总分片数与期望文件摘要
-- 领取租约：同一分片同一时刻仅一个有效租约，过期后可重新领取
+- 创建会话：记录总分片数与期望文件摘要，可选提交分片依赖图（越界/自依赖/成环将被拒绝）
+- 领取租约：同一分片同一时刻仅一个有效租约，过期后可重新领取；
+  声明了依赖的分片须等前置分片全部完成后才可领取
 - 上报完成：需携带匹配租约令牌与分片摘要，重复上报幂等
 - 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片
-- 状态查询：会话与逐分片状态
+- 状态查询：会话与逐分片状态（含各分片依赖）
+- 就绪查询：当前可领取的分片，以及被依赖阻塞的分片与各自缺失的前置项
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from .db import DB_LOCK, get_conn, init_db
 from .schemas import (
+    BlockedChunk,
     ChunkStatus,
     CompleteRequest,
     CompleteResponse,
@@ -29,6 +32,7 @@ from .schemas import (
     LeaseRequest,
     LeaseResponse,
     ManifestEntry,
+    ReadyResponse,
     SessionResponse,
     SessionStatusResponse,
 )
@@ -85,6 +89,31 @@ def lease_valid(chunk, now: datetime) -> bool:
     )
 
 
+def load_dependencies(session_id: str) -> dict[int, list[int]]:
+    """读取会话的依赖图：chunk_index -> 升序前置分片列表。"""
+    rows = get_conn().execute(
+        "SELECT chunk_index, depends_on FROM chunk_dependencies"
+        " WHERE session_id = ? ORDER BY chunk_index, depends_on",
+        (session_id,),
+    ).fetchall()
+    deps: dict[int, list[int]] = {}
+    for row in rows:
+        deps.setdefault(row["chunk_index"], []).append(row["depends_on"])
+    return deps
+
+
+def incomplete_dependencies(session_id: str, chunk_index: int) -> list[int]:
+    """返回该分片尚未完成的前置分片（升序）。"""
+    rows = get_conn().execute(
+        "SELECT d.depends_on FROM chunk_dependencies d"
+        " JOIN chunks c ON c.session_id = d.session_id AND c.chunk_index = d.depends_on"
+        " WHERE d.session_id = ? AND d.chunk_index = ? AND c.status != 'completed'"
+        " ORDER BY d.depends_on",
+        (session_id, chunk_index),
+    ).fetchall()
+    return [row["depends_on"] for row in rows]
+
+
 def conflict(message: str, **extra) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": message, **extra})
 
@@ -101,6 +130,7 @@ def conflict(message: str, **extra) -> JSONResponse:
 def create_session(req: CreateSessionRequest):
     now = utcnow()
     session_id = uuid.uuid4().hex
+    deps = req.dependencies or {}
     with DB_LOCK:
         conn = get_conn()
         conn.execute(
@@ -111,6 +141,10 @@ def create_session(req: CreateSessionRequest):
         conn.executemany(
             "INSERT INTO chunks (session_id, chunk_index) VALUES (?, ?)",
             [(session_id, i) for i in range(req.total_chunks)],
+        )
+        conn.executemany(
+            "INSERT INTO chunk_dependencies (session_id, chunk_index, depends_on) VALUES (?, ?, ?)",
+            [(session_id, idx, dep) for idx, dep_list in deps.items() for dep in dep_list],
         )
         conn.commit()
     return SessionResponse(
@@ -135,6 +169,7 @@ def get_session_status(session_id: str):
         "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
         (session_id,),
     ).fetchall()
+    deps = load_dependencies(session_id)
     now = utcnow()
 
     chunks: list[ChunkStatus] = []
@@ -154,6 +189,7 @@ def get_session_status(session_id: str):
                 lease_expires_at=lease_expires_at,
                 chunk_digest=row["chunk_digest"],
                 completed_at=parse_ts(row["completed_at"]) if row["completed_at"] else None,
+                dependencies=deps.get(row["chunk_index"], []),
             )
         )
 
@@ -171,13 +207,54 @@ def get_session_status(session_id: str):
     )
 
 
+# ---------------------------------------------------------------- 就绪查询
+
+@app.get(
+    "/sessions/{session_id}/ready",
+    response_model=ReadyResponse,
+    tags=["sessions"],
+    summary="查询当前可领取的分片与被依赖阻塞的分片",
+)
+def get_ready_chunks(session_id: str):
+    get_session_or_404(session_id)
+    rows = get_conn().execute(
+        "SELECT * FROM chunks WHERE session_id = ? ORDER BY chunk_index",
+        (session_id,),
+    ).fetchall()
+    deps = load_dependencies(session_id)
+    now = utcnow()
+
+    completed = {r["chunk_index"] for r in rows if r["status"] == "completed"}
+    ready: list[int] = []
+    blocked: list[BlockedChunk] = []
+    for row in rows:
+        chunk_index = row["chunk_index"]
+        if row["status"] == "completed":
+            continue
+        missing_deps = [d for d in deps.get(chunk_index, []) if d not in completed]
+        if missing_deps:
+            blocked.append(
+                BlockedChunk(chunk_index=chunk_index, missing_dependencies=missing_deps)
+            )
+        elif not lease_valid(row, now):
+            # 无租约或租约已过期，且前置已全部完成：立即可领取
+            ready.append(chunk_index)
+
+    return ReadyResponse(
+        session_id=session_id,
+        ready_chunks=ready,
+        blocked_chunks=blocked,
+    )
+
+
 # ---------------------------------------------------------------- 租约
 
 @app.post(
     "/sessions/{session_id}/chunks/{chunk_index}/lease",
     response_model=LeaseResponse,
     tags=["leases"],
-    summary="领取分片租约（限时，独占）",
+    summary="领取分片租约（限时，独占；前置分片未完成时返回 409）",
+    responses={409: {"description": "租约冲突；前置未完成时响应体包含 missing_dependencies"}},
 )
 def claim_lease(
     session_id: str,
@@ -201,6 +278,12 @@ def claim_lease(
             return conflict(
                 "chunk lease already held",
                 lease_expires_at=chunk["lease_expires_at"],
+            )
+        missing_deps = incomplete_dependencies(session_id, chunk_index)
+        if missing_deps:
+            return conflict(
+                "chunk dependencies not completed",
+                missing_dependencies=missing_deps,
             )
 
         token = secrets.token_urlsafe(32)
